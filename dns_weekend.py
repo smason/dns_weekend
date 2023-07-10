@@ -1,6 +1,5 @@
-import dataclasses
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from random import randrange
 from struct import Struct
@@ -108,10 +107,15 @@ class Record:
             if typ == DnsType.SOA.value:
                 fields, recend = RecordInetSOA._decode_fields(buffer, offset)
                 if recend != end:
-                    print("ignoring excess data in CNAME record")
+                    print("ignoring excess data in SOA record")
                 return RecordInetSOA(name, ttl, *fields), end
             if typ == DnsType.TXT.value:
                 return RecordInetTXT(name, ttl, buffer[offset:end].decode("ascii")), end
+            if typ == DnsType.MX.value:
+                fields, recend = RecordInetMX._decode_fields(buffer, offset)
+                if recend != end:
+                    print("ignoring excess data in MX record")
+                return RecordInetMX(name, ttl, *fields), end
         self = RecordOther(name, ttl, DnsType(typ), DnsClass(clas), buffer[offset:end])
         return self, end
 
@@ -144,6 +148,20 @@ class RecordInetTXT(Record):
 
 
 @dataclass(slots=True)
+class RecordInetMX(Record):
+    exchange: str
+    preference: int
+
+    _STRUCT = Struct("!H")
+
+    @classmethod
+    def _decode_fields(cls, buffer: bytes, offset: int) -> tuple[tuple, int]:
+        fields, offset = _unpack_from(cls._STRUCT, buffer, offset)
+        exchange, offset = _decode_name(buffer, offset)
+        return (exchange, *fields), offset
+
+
+@dataclass(slots=True)
 class RecordInetSOA(Record):
     master_name: str
     responsible_name: str
@@ -168,22 +186,12 @@ RECURSION_DESIRED = 1 << 8
 
 @dataclass(slots=True)
 class Header:
-    id: int = dataclasses.field(
-        default_factory=lambda: randrange(63336),
-    )
+    id: int = field(default_factory=lambda: randrange(63336))
     flags: int = RECURSION_DESIRED
-    questions: list[Question] = dataclasses.field(
-        default_factory=list,
-    )
-    answers: list[Record] = dataclasses.field(
-        default_factory=list,
-    )
-    authorities: list[Record] = dataclasses.field(
-        default_factory=list,
-    )
-    additionals: list[Record] = dataclasses.field(
-        default_factory=list,
-    )
+    questions: list[Question] = field(default_factory=list)
+    answers: list[Record] = field(default_factory=list)
+    authorities: list[Record] = field(default_factory=list)
+    additionals: list[Record] = field(default_factory=list)
 
     _STRUCT = Struct("!HHHHHH")
 
