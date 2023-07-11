@@ -65,12 +65,12 @@ class Question:
 
     _STRUCT = Struct("!HH")
 
-    def encode(self) -> Iterator[bytes]:
+    def _encode(self) -> Iterator[bytes]:
         yield from _encode_name(self.name)
         yield self._STRUCT.pack(self.type_.value, self.class_.value)
 
     @classmethod
-    def decode(cls, buffer: bytes, *, offset: int) -> tuple[Self, int]:
+    def _decode(cls, buffer: bytes, *, offset: int) -> tuple[Self, int]:
         name, offset = _decode_name(buffer, offset)
         (typ, clas), offset = _unpack_from(cls._STRUCT, buffer, offset)
         self = cls(name, DnsType(typ), DnsClass(clas))
@@ -85,7 +85,7 @@ class Record:
     _STRUCT = Struct("!HHIH")
 
     @staticmethod
-    def decode(buffer: bytes, *, offset: int) -> tuple["Record", int]:
+    def _decode(buffer: bytes, *, offset: int) -> tuple["Record", int]:
         name, offset = _decode_name(buffer, offset)
         (typ, clas, ttl, data_len), offset = _unpack_from(
             Record._STRUCT, buffer, offset
@@ -99,22 +99,22 @@ class Record:
                 addr = socket.inet_ntop(socket.AF_INET6, buffer[offset:end])
                 return RecordInetAAAA(name, ttl, addr), end
             if typ == DnsType.CNAME.value:
-                target, nameend = _decode_name(buffer, offset)
-                if nameend != end:
-                    # somebody trying to smuggle data at the end of a name?!
-                    print("ignoring excess data in CNAME record")
+                target, _ = _decode_name(buffer, offset)
                 return RecordInetCNAME(name, ttl, target), end
+            if typ == DnsType.PTR.value:
+                target, _ = _decode_name(buffer, offset)
+                return RecordInetPTR(name, ttl, target), end
             if typ == DnsType.SOA.value:
-                fields, recend = RecordInetSOA._decode_fields(buffer, offset)
-                if recend != end:
-                    print("ignoring excess data in SOA record")
+                fields, _ = RecordInetSOA._decode_fields(buffer, offset)
                 return RecordInetSOA(name, ttl, *fields), end
+            if typ == DnsType.SRV.value:
+                fields, _ = RecordInetSRV._decode_fields(buffer, offset)
+                return RecordInetSRV(name, ttl, *fields), end
             if typ == DnsType.TXT.value:
-                return RecordInetTXT(name, ttl, buffer[offset:end].decode("ascii")), end
+                strings = RecordInetTXT._decode_strings(buffer, offset, end)
+                return RecordInetTXT(name, ttl, strings), end
             if typ == DnsType.MX.value:
-                fields, recend = RecordInetMX._decode_fields(buffer, offset)
-                if recend != end:
-                    print("ignoring excess data in MX record")
+                fields, _ = RecordInetMX._decode_fields(buffer, offset)
                 return RecordInetMX(name, ttl, *fields), end
         self = RecordOther(name, ttl, DnsType(typ), DnsClass(clas), buffer[offset:end])
         return self, end
@@ -144,7 +144,37 @@ class RecordInetCNAME(Record):
 
 @dataclass(slots=True)
 class RecordInetTXT(Record):
-    text: str
+    text: list[str]
+
+    @staticmethod
+    def _decode_strings(buffer: bytes, offset: int, end: int) -> list[str]:
+        result = []
+        while offset < end:
+            start = offset + 1
+            offset = start + buffer[offset]
+            result.append(buffer[start:offset].decode("ascii"))
+        return result
+
+
+@dataclass(slots=True)
+class RecordInetPTR(Record):
+    target: str
+
+
+@dataclass(slots=True)
+class RecordInetSRV(Record):
+    priority: int
+    weight: int
+    port: int
+    target: str
+
+    _STRUCT = Struct("!HHH")
+
+    @classmethod
+    def _decode_fields(cls, buffer: bytes, offset: int) -> tuple[tuple, int]:
+        fields, offset = _unpack_from(cls._STRUCT, buffer, offset)
+        target, offset = _decode_name(buffer, offset)
+        return [*fields, target], offset
 
 
 @dataclass(slots=True)
@@ -186,8 +216,8 @@ RECURSION_DESIRED = 1 << 8
 
 @dataclass(slots=True)
 class Header:
-    id: int = field(default_factory=lambda: randrange(63336))
-    flags: int = RECURSION_DESIRED
+    id: int
+    flags: int
     questions: list[Question] = field(default_factory=list)
     answers: list[Record] = field(default_factory=list)
     authorities: list[Record] = field(default_factory=list)
@@ -195,8 +225,11 @@ class Header:
 
     _STRUCT = Struct("!HHHHHH")
 
-    def encode(self) -> Iterator[bytes]:
+    def encode(self) -> bytes:
         "encode a question to network bytes"
+        return b"".join(self._encode())
+
+    def _encode(self) -> Iterator[bytes]:
         assert len(self.questions) == 1, "only one question supported by DNS"
         assert not self.answers
         assert not self.authorities
@@ -211,10 +244,10 @@ class Header:
             0,
         )
         for qn in self.questions:
-            yield from qn.encode()
+            yield from qn._encode()
 
     @classmethod
-    def decode(cls, buffer: bytes, offset: int) -> tuple[Self, int]:
+    def _decode(cls, buffer: bytes, offset: int) -> tuple[Self, int]:
         (
             id,
             flags,
@@ -226,32 +259,39 @@ class Header:
 
         self = cls(id, flags)
         for _ in range(num_qns):
-            qn, offset = Question.decode(buffer, offset=offset)
+            qn, offset = Question._decode(buffer, offset=offset)
             self.questions.append(qn)
         for _ in range(num_ans):
-            ans, offset = Record.decode(buffer, offset=offset)
+            ans, offset = Record._decode(buffer, offset=offset)
             self.answers.append(ans)
         for _ in range(num_auth):
-            ans, offset = Record.decode(buffer, offset=offset)
+            ans, offset = Record._decode(buffer, offset=offset)
             self.authorities.append(ans)
         for _ in range(num_extra):
-            ans, offset = Record.decode(buffer, offset=offset)
+            ans, offset = Record._decode(buffer, offset=offset)
             self.additionals.append(ans)
 
         return self, offset
 
 
-def make_question(name: str, flags: int = RECURSION_DESIRED, qtype: str = "A") -> bytes:
+def make_question(
+    name: str,
+    qtype: str = "A",
+    *,
+    id: int | None = None,
+    flags: int = RECURSION_DESIRED,
+) -> Header:
+    if id is None:
+        id = randrange(65536)
     qn = Question(
         name,
         type_=getattr(DnsType, qtype),
     )
-    hdr = Header(flags=flags, questions=[qn])
-    return b"".join(hdr.encode())
+    return Header(id=id, flags=flags, questions=[qn])
 
 
 def decode_response(buffer: bytes) -> Header:
-    result, offset = Header.decode(buffer, 0)
+    result, offset = Header._decode(buffer, 0)
     if offset != len(buffer):
         print("extra bytes after packet")
     return result
